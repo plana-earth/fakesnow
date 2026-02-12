@@ -410,6 +410,110 @@ def test_errors_parquet(dcur: snowflake.connector.cursor.DictCursor, s3_client: 
     )
 
 
+def test_copy_parquet_match_by_column_name(dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client) -> None:
+    """Test COPY INTO with MATCH_BY_COLUMN_NAME for parquet files.
+
+    This allows loading parquet files directly from a stage without needing a subquery transformation.
+    Columns are matched by name (case-insensitive when CASE_INSENSITIVE is specified).
+    """
+    create_table(dcur)
+    # Create parquet with columns matching the table (but different order to test matching)
+    parquet_data = pd.DataFrame({"B": [10, 20], "A": [1, 2]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
+
+    # This should work with MATCH_BY_COLUMN_NAME
+    dcur.execute(
+        """
+        COPY INTO table1
+        FROM @stage1
+        FILES=('data.parquet')
+        MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        FILE_FORMAT = (TYPE = 'PARQUET')
+        """
+    )
+
+    result = dcur.fetchall()
+    assert result[0]["status"] == "LOADED"
+    assert result[0]["rows_loaded"] == 2
+
+    dcur.execute("SELECT * FROM schema1.table1 ORDER BY A")
+    assert dcur.fetchall() == [{"A": 1, "B": 10}, {"A": 2, "B": 20}]
+
+
+def test_copy_parquet_match_by_column_name_case_sensitive(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    """Test COPY INTO with MATCH_BY_COLUMN_NAME = CASE_SENSITIVE for parquet files."""
+    create_table(dcur)
+    # Create parquet with exact case-matching column names
+    parquet_data = pd.DataFrame({"B": [10, 20], "A": [1, 2]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
+
+    dcur.execute(
+        """
+        COPY INTO table1
+        FROM @stage1
+        FILES=('data.parquet')
+        MATCH_BY_COLUMN_NAME = CASE_SENSITIVE
+        FILE_FORMAT = (TYPE = 'PARQUET')
+        """
+    )
+
+    result = dcur.fetchall()
+    assert result[0]["status"] == "LOADED"
+    assert result[0]["rows_loaded"] == 2
+
+    dcur.execute("SELECT * FROM schema1.table1 ORDER BY A")
+    assert dcur.fetchall() == [{"A": 1, "B": 10}, {"A": 2, "B": 20}]
+
+
+def test_copy_parquet_match_by_column_name_invalid_value(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    """Test that invalid MATCH_BY_COLUMN_NAME values are rejected."""
+    create_table(dcur)
+    parquet_data = pd.DataFrame({"B": [10, 20], "A": [1, 2]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
+
+    with pytest.raises(snowflake.connector.errors.ProgrammingError) as excinfo:
+        dcur.execute(
+            """
+            COPY INTO table1
+            FROM @stage1
+            FILES=('data.parquet')
+            MATCH_BY_COLUMN_NAME = INVALID_VALUE
+            FILE_FORMAT = (TYPE = 'PARQUET')
+            """
+        )
+    assert "Invalid value 'INVALID_VALUE' for parameter MATCH_BY_COLUMN_NAME" in str(excinfo.value)
+
+
+def test_copy_parquet_match_by_column_name_none(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    """Test that MATCH_BY_COLUMN_NAME = NONE is treated as disabled (requires subquery)."""
+    create_table(dcur)
+    parquet_data = pd.DataFrame({"B": [10, 20], "A": [1, 2]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
+
+    # NONE means disabled, so direct parquet load should fail
+    with pytest.raises(snowflake.connector.errors.ProgrammingError) as excinfo:
+        dcur.execute(
+            """
+            COPY INTO table1
+            FROM @stage1
+            FILES=('data.parquet')
+            MATCH_BY_COLUMN_NAME = NONE
+            FILE_FORMAT = (TYPE = 'PARQUET')
+            """
+        )
+    assert "MATCH_BY_COLUMN_NAME copy option or copy with transformation" in str(excinfo.value)
+
+
 def test_force(dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client) -> None:
     create_table(dcur)
     bucket = str(uuid.uuid4())

@@ -46,16 +46,6 @@ def copy_into(
     params: MutableParams | None = None,
 ) -> str:
     cparams = _params(expr, params)
-    if isinstance(cparams.file_format, ReadParquet):
-        from_ = expr.args["files"][0]
-        # parquet must use MATCH_BY_COLUMN_NAME (TODO) or a copy transformation
-        # ie: the from clause in COPY INTO must be a subquery
-        if not isinstance(from_, exp.Subquery):
-            raise snowflake.connector.errors.ProgrammingError(
-                msg="SQL compilation error:\nPARQUET file format can produce one and only one column of type variant, object, or array. Load data into separate columns using the MATCH_BY_COLUMN_NAME copy option or copy with transformation.",  # noqa: E501
-                errno=2019,
-                sqlstate="0A000",
-            )
 
     from_source = _from_source(expr)
     source = (
@@ -68,6 +58,27 @@ def copy_into(
         sql = "SELECT 'Copy executed with 0 files processed.' AS status"
         duck_conn.execute(sql)
         return sql
+
+    # Infer parquet format from URL if no explicit file format was set
+    # Snowflake auto-detects file format from extension when not specified
+    if not cparams.explicit_file_format:
+        sample_url = urls[0] if urls else source
+        if sample_url.lower().endswith(".parquet"):
+            cparams.file_format = ReadParquet()
+
+    if isinstance(cparams.file_format, ReadParquet):
+        from_ = expr.args["files"][0]
+        # Parquet requires either:
+        # 1. A copy transformation (subquery), e.g. FROM (SELECT $1:col FROM @stage)
+        # 2. MATCH_BY_COLUMN_NAME option to match parquet columns to table columns by name
+        # Note: MATCH_BY_COLUMN_NAME is implemented via DuckDB's INSERT BY NAME, which is
+        # case-insensitive. True CASE_SENSITIVE matching with quoted identifiers is not supported.
+        if not isinstance(from_, exp.Subquery) and not cparams.match_by_column_name:
+            raise snowflake.connector.errors.ProgrammingError(
+                msg="SQL compilation error:\nPARQUET file format can produce one and only one column of type variant, object, or array. Load data into separate columns using the MATCH_BY_COLUMN_NAME copy option or copy with transformation.",  # noqa: E501
+                errno=2019,
+                sqlstate="0A000",
+            )
 
     inserts = _inserts(expr, cparams, urls)
     table = expr.this
@@ -167,6 +178,7 @@ def _params(expr: exp.Copy, params: MutableParams | None = None) -> CopyParams:
     force = False
     purge = False
     on_error = "ABORT_STATEMENT"
+    explicit_file_format = False
 
     cparams = CopyParams()
     for param in cast(list[exp.CopyParameter], expr.args.get("params", [])):
@@ -180,6 +192,7 @@ def _params(expr: exp.Copy, params: MutableParams | None = None) -> CopyParams:
             if not var_type:
                 raise NotImplementedError("FILE_FORMAT without TYPE is not currently implemented")
 
+            explicit_file_format = True
             if var_type == "CSV":
                 kwargs["file_format"] = handle_csv(param.expressions)
             elif var_type == "PARQUET":
@@ -202,10 +215,24 @@ def _params(expr: exp.Copy, params: MutableParams | None = None) -> CopyParams:
 
             if not (isinstance(on_error, str) and on_error.upper() == "ABORT_STATEMENT"):
                 raise NotImplementedError(param)
+        elif var == "MATCH_BY_COLUMN_NAME":
+            if isinstance(param.expression, exp.Var):
+                value = param.expression.name.upper()
+                if value not in ("CASE_SENSITIVE", "CASE_INSENSITIVE", "NONE"):
+                    raise snowflake.connector.errors.ProgrammingError(
+                        msg=f"SQL compilation error:\nInvalid value '{value}' for parameter MATCH_BY_COLUMN_NAME",
+                        errno=1006,
+                        sqlstate="42000",
+                    )
+                # NONE means disabled, treat as if not specified
+                if value != "NONE":
+                    kwargs["match_by_column_name"] = value
+            else:
+                raise NotImplementedError(f"MATCH_BY_COLUMN_NAME with {param.expression.__class__=}")
         else:
             raise ValueError(f"Unknown copy parameter: {param.this}")
 
-    return CopyParams(force=force, purge=purge, on_error=on_error, **kwargs)
+    return CopyParams(force=force, purge=purge, on_error=on_error, explicit_file_format=explicit_file_format, **kwargs)
 
 
 def _from_source(expr: exp.Copy) -> str:
@@ -239,7 +266,14 @@ def _from_source(expr: exp.Copy) -> str:
 def stage_url_from_var(
     var: str, duck_conn: DuckDBPyConnection, current_database: str | None, current_schema: str | None
 ) -> str:
-    database_name, schema_name, name = stage.parts_from_var(var, current_database, current_schema)
+    # Split off any path suffix (e.g., @STAGE/path/to/file.parquet -> STAGE, path/to/file.parquet)
+    # The stage reference can include a path that should be appended to the stage URL
+    if "/" in var:
+        stage_ref, path_suffix = var.split("/", 1)
+    else:
+        stage_ref, path_suffix = var, None
+
+    database_name, schema_name, name = stage.parts_from_var(stage_ref, current_database, current_schema)
 
     # Look up the stage URL
     duck_conn.execute(
@@ -252,6 +286,12 @@ def stage_url_from_var(
     if result := duck_conn.fetchone():
         # if no URL is found, it is an internal stage ie: local directory
         url = result[0] or stage.internal_dir(f"{database_name}.{schema_name}.{name}")
+        # Append the path suffix if present
+        if path_suffix:
+            # Ensure proper URL joining (add / if needed)
+            if not url.endswith("/"):
+                url += "/"
+            url += path_suffix
         return url
     else:
         raise snowflake.connector.errors.ProgrammingError(
@@ -308,15 +348,21 @@ def _inserts(expr: exp.Copy, params: CopyParams, urls: list[str]) -> list[exp.Ex
         select = from_.this
         assert isinstance(select, exp.Select), f"{select.__class__} is not a Select"
         columns = _strip_json_extract(select).expressions
+        # Subquery already specifies columns explicitly, don't use BY NAME
+        by_name = False
     else:
         columns = [exp.Column(this=exp.Identifier(this=f"column{i}")) for i in range(len(target.expressions))] or [
             exp.Column(this=exp.Star())
         ]
+        # Use INSERT BY NAME for direct stage references with MATCH_BY_COLUMN_NAME
+        # This enables column matching by name for parquet files without subquery transformations
+        by_name = params.match_by_column_name is not None
 
     return [
         exp.Insert(
             this=target,
             expression=exp.Select(expressions=columns).from_(exp.Table(this=params.file_format.read_expression(url))),
+            by_name=by_name,
         )
         for url in urls
     ]
@@ -416,3 +462,5 @@ class CopyParams:
     force: bool = False
     purge: bool = False
     on_error: str = "ABORT_STATEMENT"  # Default to ABORT_STATEMENT
+    match_by_column_name: str | None = None  # CASE_SENSITIVE or CASE_INSENSITIVE
+    explicit_file_format: bool = False  # True if FILE_FORMAT was explicitly set
