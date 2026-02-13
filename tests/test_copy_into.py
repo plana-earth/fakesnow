@@ -417,12 +417,11 @@ def test_copy_parquet_match_by_column_name(dcur: snowflake.connector.cursor.Dict
     Columns are matched by name (case-insensitive when CASE_INSENSITIVE is specified).
     """
     create_table(dcur)
-    # Create parquet with columns matching the table (but different order to test matching)
-    parquet_data = pd.DataFrame({"B": [10, 20], "A": [1, 2]}).to_parquet()
+    # Create parquet with lowercase columns to test case-insensitive matching
+    parquet_data = pd.DataFrame({"B": [10, 20], "a": [1, 2]}).to_parquet()
     bucket = upload_file(s3_client, parquet_data, key="data.parquet")
     dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
 
-    # This should work with MATCH_BY_COLUMN_NAME
     dcur.execute(
         """
         COPY INTO table1
@@ -444,10 +443,13 @@ def test_copy_parquet_match_by_column_name(dcur: snowflake.connector.cursor.Dict
 def test_copy_parquet_match_by_column_name_case_sensitive(
     dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
 ) -> None:
-    """Test COPY INTO with MATCH_BY_COLUMN_NAME = CASE_SENSITIVE for parquet files."""
+    """Test COPY INTO with MATCH_BY_COLUMN_NAME = CASE_SENSITIVE for parquet files.
+
+    With CASE_SENSITIVE, only columns with exact case match are loaded.
+    Unmatched columns get NULL values.
+    """
     create_table(dcur)
-    # Create parquet with exact case-matching column names
-    parquet_data = pd.DataFrame({"B": [10, 20], "A": [1, 2]}).to_parquet()
+    parquet_data = pd.DataFrame({"B": [10, 20], "c": [1, 2]}).to_parquet()
     bucket = upload_file(s3_client, parquet_data, key="data.parquet")
     dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
 
@@ -465,8 +467,9 @@ def test_copy_parquet_match_by_column_name_case_sensitive(
     assert result[0]["status"] == "LOADED"
     assert result[0]["rows_loaded"] == 2
 
-    dcur.execute("SELECT * FROM schema1.table1 ORDER BY A")
-    assert dcur.fetchall() == [{"A": 1, "B": 10}, {"A": 2, "B": 20}]
+    # A should be NULL because 'c' doesn't match 'A' (case-sensitive)
+    dcur.execute("SELECT * FROM schema1.table1 ORDER BY B")
+    assert dcur.fetchall() == [{"A": None, "B": 10}, {"A": None, "B": 20}]
 
 
 def test_copy_parquet_match_by_column_name_invalid_value(
@@ -512,6 +515,77 @@ def test_copy_parquet_match_by_column_name_none(
             """
         )
     assert "MATCH_BY_COLUMN_NAME copy option or copy with transformation" in str(excinfo.value)
+
+
+def test_copy_parquet_single_variant_column(dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client) -> None:
+    """Test COPY INTO with single VARIANT column - loads entire parquet row as JSON.
+
+    When destination table has exactly one VARIANT column, parquet can be loaded directly
+    without MATCH_BY_COLUMN_NAME or a transformation. The entire row becomes a JSON object.
+    """
+    dcur.execute("CREATE SCHEMA IF NOT EXISTS schema1")
+    dcur.execute("USE SCHEMA schema1")
+    dcur.execute("CREATE OR REPLACE TABLE variant_table (data VARIANT)")
+
+    parquet_data = pd.DataFrame({"A": [1, 2], "B": [10, 20]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
+
+    # This should work without MATCH_BY_COLUMN_NAME or transformation
+    dcur.execute(
+        """
+        COPY INTO variant_table
+        FROM @stage1
+        FILES=('data.parquet')
+        FILE_FORMAT = (TYPE = 'PARQUET')
+        """
+    )
+
+    result = dcur.fetchall()
+    assert result[0]["status"] == "LOADED"
+    assert result[0]["rows_loaded"] == 2
+
+    dcur.execute("SELECT data FROM schema1.variant_table ORDER BY data:A")
+    rows = dcur.fetchall()
+    # Each row should be a JSON object with the parquet columns
+    assert rows[0]["DATA"] == '{"A":1,"B":10}'
+    assert rows[1]["DATA"] == '{"A":2,"B":20}'
+
+
+def test_copy_parquet_match_by_column_name_none_with_variant(
+    dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client
+) -> None:
+    """Test MATCH_BY_COLUMN_NAME = NONE behaves same as not specifying it.
+
+    NONE is the default and means "load into variant column or use transform".
+    """
+    dcur.execute("CREATE SCHEMA IF NOT EXISTS schema1")
+    dcur.execute("USE SCHEMA schema1")
+    dcur.execute("CREATE OR REPLACE TABLE variant_table (data VARIANT)")
+
+    parquet_data = pd.DataFrame({"A": [1, 2], "B": [10, 20]}).to_parquet()
+    bucket = upload_file(s3_client, parquet_data, key="data.parquet")
+    dcur.execute(f"CREATE STAGE stage1 url='s3://{bucket}/'")
+
+    # MATCH_BY_COLUMN_NAME = NONE should work with single VARIANT column
+    dcur.execute(
+        """
+        COPY INTO variant_table
+        FROM @stage1
+        FILES=('data.parquet')
+        FILE_FORMAT = (TYPE = 'PARQUET')
+        MATCH_BY_COLUMN_NAME = NONE
+        """
+    )
+
+    result = dcur.fetchall()
+    assert result[0]["status"] == "LOADED"
+    assert result[0]["rows_loaded"] == 2
+
+    dcur.execute("SELECT data FROM schema1.variant_table ORDER BY data:A")
+    rows = dcur.fetchall()
+    assert rows[0]["DATA"] == '{"A":1,"B":10}'
+    assert rows[1]["DATA"] == '{"A":2,"B":20}'
 
 
 def test_force(dcur: snowflake.connector.cursor.DictCursor, s3_client: S3Client) -> None:
