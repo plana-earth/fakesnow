@@ -68,7 +68,6 @@ def copy_into(
         # 2. MATCH_BY_COLUMN_NAME option to match parquet columns to table columns by name
         # 3. A dest table with a single VARIANT column (loads entire row as JSON)
         if not isinstance(from_, exp.Subquery) and cparams.match_by_column_name == MatchByColumnName.NONE:
-            # Check if dest table has exactly one VARIANT column
             is_single_variant = _is_single_variant_column_table(expr.this, duck_conn, current_database, current_schema)
             if not is_single_variant:
                 raise snowflake.connector.errors.ProgrammingError(
@@ -88,7 +87,6 @@ def copy_into(
     schema = table.db or current_schema
     assert schema
 
-    # Get target table columns for MATCH_BY_COLUMN_NAME
     target_columns = (
         _get_table_columns(table, duck_conn, current_database, schema)
         if cparams.match_by_column_name != MatchByColumnName.NONE
